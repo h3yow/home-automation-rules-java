@@ -27,7 +27,8 @@
 - `actions`：多个动作的**有序序列**，动作形如把 `targetDeviceId.property` 设为 `value`。
   每个动作有稳定的 `actionDefId`。
 - `enabled`：启停状态。
-- `version`：每次启停 / 参数调整都产生新版本（+1）。
+- `cooldownMillis`：**最短触发间隔（冷却，毫秒）**，默认 `0` 表示不配置冷却。
+- `version`：每次启停 / 参数调整（含冷却调整）都产生新版本（+1）。
 
 ### 1.3 触发语义：边沿触发
 
@@ -38,7 +39,29 @@
 - 条件持续满足期间，无论收到多少条（哪怕值不同的）上报，**都不重复触发**；
 - 条件离开（true→false）后重新进入，才会再次触发。
 
-### 1.4 运行中变更立即生效
+### 1.4 冷却（最短触发间隔）
+
+规则可设置 `cooldownMillis > 0`，用来压住阈值附近抖动造成的反复穿越：
+
+- **触发后进入冷却**：一次真正触发（动作序列开始执行，即使后续部分失败并补偿也算触发）后，
+  冷却窗口 `[lastFiredAt, lastFiredAt + cooldownMillis)` 内出现的任何 false→true 边沿
+  **一律挡下**，不领取 `fireNo`、不下发任何动作；
+- **冷却不压制“本该触发的那一次”**：挡下的边沿**不刷新**计时基准，窗口不会被抖动无限延长；
+  冷却结束后条件需要**重新出现一次 false→true** 才触发——若条件在冷却结束时仍一直满足，
+  不会补发，必须等下一次离开再进入（语义可预测：冷却是“忽略窗口内的边沿”，不是延时触发）；
+- **默认值与兼容范围**：`cooldownMillis=0`（默认/新建规则/未设置）时冷却逻辑完全旁路，
+  行为与旧版本逐字节一致；冷却只作用于“边沿是否放行”，不改变事件接入、幂等、
+  序号确认、动作执行与补偿的任何既有语义；
+- **计时口径（明确可预测）**：冷却只认**引擎处理该已确认事件的本地墙钟时刻（毫秒）**
+  （`RuleClock`），**不使用事件自带的 `eventTime`**——迟到/乱序事件的产生时间可能很旧，
+  用它计时会依赖上报端时钟、无法预测；窗口按**左闭右开**判定，
+  `now - lastFiredAt < cooldownMillis` 挡下，等于窗口长度时放行；
+- **运行中随时可改、各规则独立**：调长、调短、置 `0` 关闭都通过不可变快照原子替换立即生效，
+  且只影响后续事件；计时基准（上次触发时刻）不因改配置被清零重计——
+  例如冷却中调短到使窗口已过，下一次边沿立即放行；调长则当前边沿按新窗口继续挡；
+  每条规则各自维护边沿状态与冷却基准，互不影响。
+
+### 1.5 运行中变更立即生效
 
 规则的新增、启停、参数（名称/条件/动作）调整都在运行中生效：
 规则以**不可变快照 + volatile 引用**原子替换，在途执行读到的是旧版本，新事件读到新版本，不会出现半更新。
@@ -77,8 +100,9 @@ StateEvent { deviceId, property, rawValue, seq, eventId, eventTime }
 2. **重复上报不重复触发**：eventId 去重集合使用并发结构，同一事件并发重复投递只有一个线程通过；
    其余全部得到 `IGNORED/DUPLICATE_EVENT`。
 3. **并发只触发一次动作序列**：每台设备一把锁做「比较并确认」，每条规则一把锁做
-   「评估条件 → 判定边沿 → 领取 fireNo → 执行动作」。并发的不同事件即使都让条件处于满足态，
-   false→true 边沿全局只会发生一次，因此**不漏发也不重复下发**。
+   「评估条件 → 判定边沿 → 冷却检查 → 领取 fireNo → 执行动作」。并发的不同事件即使都让条件处于满足态，
+   false→true 边沿全局只会发生一次，冷却基准的读取与推进也在同一把规则锁内原子完成，
+   因此**抖动、乱序/迟到、近乎同时到达的一批事件都不会多触发或漏发**。
 
 > 拒绝（REJECTED）与忽略（IGNORED）是两类不同结论：前者表示事件非法、必须纠正；
 > 后者表示事件合法但已过期/重复，系统有意幂等丢弃。HTTP 层统一返回 200，
@@ -89,6 +113,18 @@ StateEvent { deviceId, property, rawValue, seq, eventId, eventTime }
 每条事件的处理结果 `IngestResult` 都带自然语言 `decision`，规则结果 `RuleFireOutcome`
 带逐动作的 `summary`。服务日志会打印**输入事件**（设备/属性/seq/eventId/值）与**判定依据**
 （哪条条件成立、是边沿还是持续满足、是否判重）。全部轨迹可通过 `/api/traces/**` 查询。
+
+规则“条件满足但没触发”有两种**可区分结论**，排查时一眼能判断是条件没到还是被冷却挡住：
+
+| skipReason | 含义 | 典型 decision 文案 |
+|------------|------|-------------------|
+| （无结果） | 条件当前不满足（连边沿都没有） | `无规则满足条件（无 false→true 边沿）` |
+| `STILL_SATISFIED` | 条件持续满足，非边沿，本就不该重复触发 | `规则 x 未触发(STILL_SATISFIED, 条件持续满足)` |
+| `COOLDOWN_ACTIVE` | 出现了 false→true 边沿，但落在冷却窗口内被挡下 | `规则 x 边沿被冷却挡下(COOLDOWN_ACTIVE, retryAt=…)` |
+
+被冷却挡下的 `RuleFireOutcome` 还带 `cooldownMillis`（当时生效的配置）与 `retryAtMillis`
+（`lastFiredAt + cooldownMillis`，下一次边沿最早可放行的处理时刻），且 `records` 为空
+（没有任何动作下发）。两类 skip 都会进入 `/api/traces/fires`，可分别统计。
 
 ---
 
@@ -140,6 +176,11 @@ idempotencyKey = ruleId : fireNo : actionDefId
 
 触发前快照同时覆盖**条件设备**（复核用）与**动作目标设备**（补偿取原值用）。
 
+补偿在物理侧（`DeviceGateway`）回滚成功后，还会把原值对称写回 `StateStore` 的**已确认状态**，
+并把 `/api/traces/actions` 中该动作记录替换为“已补偿”版本。因此回滚后
+**最终结论、动作执行记录、设备（物理 + 已确认）状态三方一致**：结论说已回滚，
+记录里对应成功动作必带 `[compensated]` 标记，查到的设备状态必为触发前原值。
+
 ---
 
 ## 4. 本地验证方法
@@ -150,14 +191,15 @@ idempotencyKey = ruleId : fireNo : actionDefId
 mvn clean test
 ```
 
-覆盖场景（共 16 个用例，测试日志会打印输入事件与判定依据）：
+覆盖场景（共 21 个用例，测试日志会打印输入事件与判定依据）：
 
 | 测试类 | 覆盖 |
 |--------|------|
 | `StateIngestTest` | 乱序/迟到/同序号/重复上报、状态不回退；未注册设备/非法取值/缺字段拒绝且原因可区分 |
 | `RuleTriggerTest` | 边沿只触发一次、持续满足不重复、离开再进入重新触发；运行中启停与调参立即生效 |
 | `ConcurrentTriggerTest` | 同一事件 16 线程并发只接受一次、动作序列一次；20 个不同事件并发只边沿触发一次 |
-| `ActionFailureTest` | 瞬时不可达重试成功；永久超时重试耗尽+补偿；不可达与超时原因区分；条件复核失败跳过 |
+| `CooldownTest` | 默认无冷却行为与旧版一致；阈值抖动下冷却只触发一次且窗口后下次边沿不被漏发；冷却期内 24 线程交错涌入不多发；运行中调短/调长/置 0 立即生效；`COOLDOWN_ACTIVE` 与 `STILL_SATISFIED` 在判定结果和追溯中可区分（固定时钟确定性断言，动作实际下发次数可断言） |
+| `ActionFailureTest` | 瞬时不可达重试成功；永久超时重试耗尽+补偿；不可达与超时原因区分；条件复核失败跳过；部分失败回滚后“结论 / 动作记录 / 物理+已确认状态”三方一致 |
 | `IdempotencyTest` | 成功后重复/失败后重复/瞬时恢复三种幂等，物理副作用次数可断言 |
 | `ApiIntegrationTest` | HTTP 端到端：查询、拒绝码、触发、动作轨迹 |
 
@@ -214,6 +256,13 @@ curl -s -X PATCH $B/api/rules/rule-cool-down -H 'Content-Type: application/json'
   "conditions":[{"deviceId":"temp-sensor","property":"temperature","operator":"GT","expected":25}],
   "actions":[{"actionDefId":"turn-off-plug","targetDeviceId":"plug","property":"on","value":false}]}'
 
+# 设置最短触发间隔（冷却）2000ms；运行中随时可改，置 0 即关闭冷却
+curl -s -X PATCH $B/api/rules/rule-cool-down/cooldown \
+  -H 'Content-Type: application/json' -d '{"cooldownMillis":2000}'
+# 冷却窗口内“离开再进入”的边沿 -> decision 中出现 COOLDOWN_ACTIVE 与 retryAt；
+# 持续满足但没有新边沿 -> STILL_SATISFIED；两者可明确区分。
+# 新建规则时也可以直接带 "cooldownMillis":2000；省略或为 0 表示不启用冷却。
+
 # 可追溯轨迹：事件判定 / 规则触发 / 动作执行
 curl -s $B/api/traces/events
 curl -s $B/api/traces/fires
@@ -228,19 +277,23 @@ curl -s $B/api/traces/actions
 model/    领域模型：Device/PropertySpec/DeviceState/StateEvent、Rule/Condition/Action、
           各类结果与可区分原因枚举（RejectReason/IgnoreReason/ActionFailureReason）
 store/    本地内存存储：DeviceRegistry、StateStore（序号单调确认）、
-          RuleStore（原子快照 + 边沿状态 + fireNo）、ExecutionLog（轨迹）
-device/   DeviceGateway（模拟设备物理副作用与故障注入）、DeviceCommandException
+          RuleStore（原子快照 + 边沿状态 + fireNo + 每规则上次触发时刻）、ExecutionLog（轨迹）
+device/   DeviceGateway（模拟设备物理副作用、故障注入与物理写入计数）、DeviceCommandException
 engine/   EventIngestService（接入/校验/幂等）、ConditionEvaluator（条件判定与解释）、
-          RuleEngine（边沿触发 + 每规则锁 + 补偿编排）、ActionExecutor（幂等/重试/复核/补偿）、
-          RuleAdminService（运行中增删改）
+          RuleEngine（边沿触发 + 冷却检查 + 每规则锁 + 补偿编排）、ActionExecutor（幂等/重试/复核/补偿）、
+          RuleClock（冷却统一计时口径，可注入固定时钟）、RuleAdminService（运行中增删改/冷却调整）
 api/      REST 控制器与统一异常处理
 config/   演示数据初始化
 ```
 
 ## 6. 设计要点小结
 
-- **顺序无关、重复无害、并发一致**：seq 单调 + eventId 幂等 + 设备/规则双级锁。
-- **结论可区分、可解释、可追溯**：拒绝原因、忽略原因、动作失败原因全部枚举化；
-  每次判定与执行都有自然语言说明并落入轨迹。
-- **失败安全**：条件复核防止过期执行；有界重试只针对可恢复故障；补偿回滚已成功副作用；
+- **顺序无关、重复无害、并发一致**：seq 单调 + eventId 幂等 + 设备/规则双级锁；
+  冷却基准在规则锁内原子读写，抖动与并发涌入不会多触发或漏发。
+- **冷却语义明确可预测**：默认关闭（与旧行为完全一致）；窗口左闭右开、只看引擎处理时刻；
+  被挡边沿不刷新基准；冷却结束后等下一次新边沿，绝不延时补发；运行中调长/调短/关闭即时生效。
+- **结论可区分、可解释、可追溯**：拒绝原因、忽略原因、动作失败原因、规则未触发原因
+  （STILL_SATISFIED / COOLDOWN_ACTIVE）全部枚举化；每次判定与执行都有自然语言说明并落入轨迹。
+- **失败安全**：条件复核防止过期执行；有界重试只针对可恢复故障；补偿回滚已成功副作用，
+  并同步回写已确认状态与轨迹标记，保证结论/记录/状态三方一致；
   补偿失败明确要求人工介入，绝不静默吞错。

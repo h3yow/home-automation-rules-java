@@ -38,6 +38,9 @@ public class DeviceGateway {
     private final Map<String, Fault> faults = new ConcurrentHashMap<>();
     /** 幂等键 -> 是否已成功执行过物理副作用。 */
     private final Set<String> executedKeys = ConcurrentHashMap.newKeySet();
+    /** (device#property) -> 真实物理写入次数（只在唯一一次副作用发生时 +1，重试不计）。 */
+    private final Map<String, java.util.concurrent.atomic.AtomicInteger> physicalWriteCounts =
+            new ConcurrentHashMap<>();
 
     private static String faultKey(String deviceId, String property) {
         return deviceId + "#" + property;
@@ -96,6 +99,14 @@ public class DeviceGateway {
         }
         // 唯一一次真实副作用。
         physicalState.put(physicalKey(deviceId, property), value);
+        physicalWriteCounts.computeIfAbsent(physicalKey(deviceId, property),
+                k -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
+    }
+
+    /** 测试辅助：统计某设备属性真正发生物理写入的次数（重试/同键重复不计）。 */
+    public int commandCountForTest(String deviceId, String property) {
+        java.util.concurrent.atomic.AtomicInteger c = physicalWriteCounts.get(physicalKey(deviceId, property));
+        return c == null ? 0 : c.get();
     }
 
     /** 测试辅助：统计设备物理侧被写入的属性数量。 */
@@ -108,5 +119,6 @@ public class DeviceGateway {
         physicalState.clear();
         faults.clear();
         executedKeys.clear();
+        physicalWriteCounts.clear();
     }
 }

@@ -169,7 +169,12 @@ public class ActionExecutor {
         }
         try {
             gateway.sendCommand(compKey, action.targetDeviceId(), action.property(), original);
-            log.info("补偿成功 key={} 回滚 {}={}", compKey, action.targetDeviceId(), action.property(), original);
+            // 同步回滚“已确认状态”：动作成功时曾把目标值写入 StateStore，补偿必须对称回写，
+            // 否则会出现“物理侧已回滚、但查询到的已确认状态仍是触发后值”的三方不一致。
+            stateStore.applyCommand(action.targetDeviceId(), action.property(), original,
+                    System.currentTimeMillis());
+            log.info("补偿成功 key={} 回滚 {}={}（物理侧与已确认状态均已回滚）",
+                    compKey, action.targetDeviceId(), action.property(), original);
             return true;
         } catch (DeviceCommandException ex) {
             log.error("补偿失败 key={} reason={}", compKey, ex.reason());

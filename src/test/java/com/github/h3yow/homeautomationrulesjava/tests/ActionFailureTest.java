@@ -12,6 +12,7 @@ import com.github.h3yow.homeautomationrulesjava.store.DeviceRegistry;
 import com.github.h3yow.homeautomationrulesjava.engine.ActionExecutor;
 import com.github.h3yow.homeautomationrulesjava.engine.EventIngestService;
 import com.github.h3yow.homeautomationrulesjava.model.ActionFailureReason;
+import com.github.h3yow.homeautomationrulesjava.model.ActionExecutionRecord;
 import com.github.h3yow.homeautomationrulesjava.model.ActionStatus;
 import com.github.h3yow.homeautomationrulesjava.model.RuleFireOutcome;
 import com.github.h3yow.homeautomationrulesjava.store.ExecutionLog;
@@ -143,6 +144,33 @@ class ActionFailureTest {
         assertEquals(null, gateway.physicalValue("lock", "locked"), "lock 从未成功，无残留副作用");
         // 补偿幂等：补偿键只执行一次。
         assertTrue(fire.summary().contains("rolled back to pre-fire state"));
+
+        // 三方一致性：最终结论、动作执行记录（轨迹）、设备已确认/物理状态必须互相吻合，
+        // 不允许出现“结论说已回滚，但记录或状态没跟上”的情况。
+        // 1) 最终结论：部分失败；且声称已回滚到触发前状态。
+        assertTrue(fire.partiallyFailed(), "最终结论必须是部分失败");
+        assertFalse(fire.fullySuccessful());
+        // 2) 执行记录：plug 记录标记 compensated、状态仍保留其成功事实；lock 记录 FAILED 未补偿。
+        assertTrue(plugRec.compensated(), "记录侧: plug 必须标记已补偿");
+        assertEquals(ActionStatus.SUCCESS, plugRec.status(), "记录侧: plug 保留曾成功的事实，补偿是额外标记");
+        assertFalse(lockRec.compensated(), "记录侧: lock 从未成功，不存在补偿");
+        long plugRecords = executionLog.actionRecords().stream()
+                .filter(r -> r.action().actionDefId().equals("turn-off-plug")).count();
+        assertEquals(1, plugRecords, "记录侧: 幂等保证 plug 只有一条动作执行记录");
+        // 轨迹里被标记补偿的成功动作数量必须与结论里的 compensated 数量一致。
+        long compensatedInLog = executionLog.actionRecords().stream()
+                .filter(ActionExecutionRecord::compensated).count();
+        assertTrue(compensatedInLog >= 1);
+        assertTrue(fire.summary().contains("compensated " + compensatedInLog + " "),
+                "结论中的补偿数量必须与执行记录一致");
+        // 3) 设备状态：物理侧与 StateStore 已确认状态都已回到触发前基线（plug=true）。
+        assertEquals(Boolean.TRUE, gateway.physicalValue("plug", "on"), "物理侧: plug 已回滚");
+        assertEquals(Boolean.TRUE, stateStore.snapshotOf("plug").valueOf("on"),
+                "已确认状态侧: plug 必须同步回滚，不能物理回滚了但状态还停在 false");
+        assertEquals(null, stateStore.snapshotOf("lock").valueOf("locked"),
+                "已确认状态侧: lock 从未成功，保持无值");
+        log.info("[三方一致性] 结论=PARTIAL-FAILURE+rolled-back; 记录 compensated={}; 物理/已确认状态 plug=true, lock=null",
+                compensatedInLog);
     }
 
     @Test

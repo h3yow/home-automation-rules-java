@@ -48,6 +48,18 @@ public class ExecutionLog {
         actions.add(record);
     }
 
+    /**
+     * 补偿完成后，把轨迹中同一幂等键的动作记录替换为“已补偿”版本，
+     * 保证 /api/traces/actions 查到的记录与最终结论（已回滚）一致。
+     */
+    public void markActionCompensated(String idempotencyKey, ActionExecutionRecord marked) {
+        for (int i = 0; i < actions.size(); i++) {
+            if (actions.get(i).idempotencyKey().equals(idempotencyKey)) {
+                actions.set(i, marked);
+            }
+        }
+    }
+
     public void clear() {
         events.clear();
         fires.clear();

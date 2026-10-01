@@ -80,8 +80,9 @@ public class EventIngestService {
                 result.ignoreReason(), result.decision());
         if (result.outcome() == com.github.h3yow.homeautomationrulesjava.model.IngestOutcomeType.ACCEPTED) {
             for (RuleFireOutcome o : result.ruleOutcomes()) {
-                log.info("  规则结果 rule={} fired={} fireNo={} summary={}",
-                        o.ruleId(), o.fired(), o.fireNo(), o.summary().replace("\n", " | "));
+                log.info("  规则结果 rule={} fired={} fireNo={} skip={} cooldownMs={} retryAt={} summary={}",
+                        o.ruleId(), o.fired(), o.fireNo(), o.skipReason(),
+                        o.cooldownMillis(), o.retryAtMillis(), o.summary().replace("\n", " | "));
             }
         }
         executionLog.appendEvent(event.deviceId(), event.property(), event.seq(), event.eventId(), result);
@@ -129,12 +130,10 @@ public class EventIngestService {
                         "同序号重复上报:seq=" + event.seq() + " 已确认，幂等忽略");
             }
             case ACCEPTED -> {
-                // 6) 状态确认成功 -> 评估规则（边沿触发 + 每规则锁，保证并发只触发一次）。
+                // 6) 状态确认成功 -> 评估规则（边沿触发 + 冷却 + 每规则锁，保证并发只触发一次）。
                 List<RuleFireOutcome> outcomes = ruleEngine.onStateConfirmed();
                 String decision = "接受上报并确认状态:" + event.deviceId() + "." + event.property()
-                        + "=" + normalized + " seq=" + event.seq()
-                        + (outcomes.isEmpty() ? "；无规则边沿触发"
-                        : "；触发规则 " + outcomes.stream().map(RuleFireOutcome::ruleId).toList());
+                        + "=" + normalized + " seq=" + event.seq() + describeRuleOutcomes(outcomes);
                 return IngestResult.accepted(event.eventId(), normalized, decision, outcomes);
             }
             default -> throw new IllegalStateException("unknown confirm status: " + confirm.status());
@@ -143,6 +142,28 @@ public class EventIngestService {
 
     private static boolean isBlank(String s) {
         return s == null || s.isBlank();
+    }
+
+    /**
+     * 把规则评估结论拼进事件判定说明：真正触发 / 被冷却挡下（带可触发时刻）/
+     * 条件持续满足不重复触发，三类情况在事件结果里一眼可区分。
+     */
+    private static String describeRuleOutcomes(List<RuleFireOutcome> outcomes) {
+        if (outcomes.isEmpty()) {
+            return "；无规则满足条件（无 false→true 边沿）";
+        }
+        List<String> parts = new java.util.ArrayList<>();
+        for (RuleFireOutcome o : outcomes) {
+            if (o.fired()) {
+                parts.add("规则 " + o.ruleId() + " 已触发(fireNo=" + o.fireNo() + ")");
+            } else if (o.suppressedByCooldown()) {
+                parts.add("规则 " + o.ruleId() + " 边沿被冷却挡下(COOLDOWN_ACTIVE, retryAt="
+                        + o.retryAtMillis() + ")");
+            } else {
+                parts.add("规则 " + o.ruleId() + " 未触发(STILL_SATISFIED, 条件持续满足)");
+            }
+        }
+        return "；" + String.join("；", parts);
     }
 
     /** 测试/演示重置：清空已处理 eventId 幂等集合。 */

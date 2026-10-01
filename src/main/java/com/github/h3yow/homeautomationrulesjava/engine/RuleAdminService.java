@@ -31,14 +31,21 @@ public class RuleAdminService {
         this.deviceRegistry = deviceRegistry;
     }
 
-    /** 新增规则（默认 version=1），同时校验全部条件与动作。 */
+    /** 新增规则（默认 version=1、不配置冷却），同时校验全部条件与动作。 */
     public Rule createRule(String id, String name, boolean enabled,
                            List<Condition> conditions, List<Action> actions) {
+        return createRule(id, name, enabled, conditions, actions, 0L);
+    }
+
+    /** 新增规则并指定最短触发间隔 cooldownMillis（0 表示不配置冷却，行为与旧版本一致）。 */
+    public Rule createRule(String id, String name, boolean enabled,
+                           List<Condition> conditions, List<Action> actions, long cooldownMillis) {
         validate(conditions, actions);
-        Rule rule = new Rule(id, name, enabled, conditions, actions, 1);
+        validateCooldown(cooldownMillis);
+        Rule rule = new Rule(id, name, enabled, conditions, actions, 1, cooldownMillis);
         ruleStore.add(rule);
-        log.info("规则已新增 id={} enabled={} conditions={} actions={}", id, enabled,
-                conditions.size(), actions.size());
+        log.info("规则已新增 id={} enabled={} cooldownMillis={} conditions={} actions={}",
+                id, enabled, cooldownMillis, conditions.size(), actions.size());
         return rule;
     }
 
@@ -62,6 +69,22 @@ public class RuleAdminService {
         return updated;
     }
 
+    /**
+     * 运行中调整最短触发间隔（冷却），通过不可变快照原子替换，立即对后续事件生效：
+     * 调长（正在冷却中的边沿按新窗口继续挡）、调短（可能立刻放行下一次边沿）、
+     * 置 0（关闭冷却，恢复纯边沿语义）都管用；每条规则各自独立，互不影响。
+     * 计时基准（上次触发时刻）保持不变，因此不存在“改配置就把冷却清零重计”的意外。
+     */
+    public Rule setCooldown(String ruleId, long cooldownMillis) {
+        validateCooldown(cooldownMillis);
+        Rule current = mustExist(ruleId);
+        Rule updated = current.withCooldown(cooldownMillis);
+        ruleStore.replace(updated);
+        log.info("规则 {} 冷却已运行中调整 cooldownMillis={} (version={})",
+                ruleId, cooldownMillis, updated.version());
+        return updated;
+    }
+
     public Rule get(String ruleId) {
         return mustExist(ruleId);
     }
@@ -76,6 +99,12 @@ public class RuleAdminService {
             throw new IllegalArgumentException("rule not found: " + ruleId);
         }
         return current;
+    }
+
+    private static void validateCooldown(long cooldownMillis) {
+        if (cooldownMillis < 0) {
+            throw new IllegalArgumentException("cooldownMillis must be >= 0 (0 disables cooldown)");
+        }
     }
 
     private void validate(List<Condition> conditions, List<Action> actions) {
