@@ -26,6 +26,8 @@ public class RuleStore {
     private volatile Snapshot snapshot = new Snapshot(Map.of());
     private final Map<String, Boolean> satisfied = new ConcurrentHashMap<>();
     private final Map<String, Long> fireCount = new ConcurrentHashMap<>();
+    /** 每条规则“最近一次实际触发”时的引擎时钟毫秒值；0 表示从未触发（冷却窗口起点）。 */
+    private final Map<String, Long> lastFiredAt = new ConcurrentHashMap<>();
 
     /** 新增规则。 */
     public synchronized void add(Rule rule) {
@@ -36,6 +38,7 @@ public class RuleStore {
         snapshot = new Snapshot(Map.copyOf(next));
         satisfied.putIfAbsent(rule.id(), Boolean.FALSE);
         fireCount.putIfAbsent(rule.id(), 0L);
+        lastFiredAt.putIfAbsent(rule.id(), 0L);
     }
 
     /** 整体原子替换规则定义（启停或参数调整后调用）。 */
@@ -48,6 +51,7 @@ public class RuleStore {
         snapshot = new Snapshot(Map.copyOf(next));
         satisfied.putIfAbsent(rule.id(), Boolean.FALSE);
         fireCount.putIfAbsent(rule.id(), 0L);
+        lastFiredAt.putIfAbsent(rule.id(), 0L);
     }
 
     public Rule get(String ruleId) {
@@ -75,9 +79,24 @@ public class RuleStore {
         return fireCount.merge(ruleId, 1L, Long::sum);
     }
 
+    /** 最近一次实际触发的引擎时钟毫秒值；从未触发返回 0。 */
+    public long lastFiredAt(String ruleId) {
+        return lastFiredAt.getOrDefault(ruleId, 0L);
+    }
+
+    /**
+     * 记录一次实际触发的时刻（冷却窗口起点）。
+     * 调用方必须已持有该规则的串行锁，因此这里用普通 put 即可，
+     * 与 fireNo 领取、边沿更新共同构成该规则的原子判定段。
+     */
+    public void markFiredAt(String ruleId, long nowMillis) {
+        lastFiredAt.put(ruleId, nowMillis);
+    }
+
     /** 测试/演示重置：清空边沿状态与触发计数，保留规则定义本身。 */
     public void resetRuntime() {
         satisfied.replaceAll((k, v) -> Boolean.FALSE);
         fireCount.replaceAll((k, v) -> 0L);
+        lastFiredAt.replaceAll((k, v) -> 0L);
     }
 }

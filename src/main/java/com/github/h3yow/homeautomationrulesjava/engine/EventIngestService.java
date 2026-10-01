@@ -80,8 +80,9 @@ public class EventIngestService {
                 result.ignoreReason(), result.decision());
         if (result.outcome() == com.github.h3yow.homeautomationrulesjava.model.IngestOutcomeType.ACCEPTED) {
             for (RuleFireOutcome o : result.ruleOutcomes()) {
-                log.info("  规则结果 rule={} fired={} fireNo={} summary={}",
-                        o.ruleId(), o.fired(), o.fireNo(), o.summary().replace("\n", " | "));
+                log.info("  规则结果 rule={} fired={} fireNo={} skipReason={} cooldownRemaining={} summary={}",
+                        o.ruleId(), o.fired(), o.fireNo(), o.skipReason(),
+                        o.cooldownRemaining(), o.summary().replace("\n", " | "));
             }
         }
         executionLog.appendEvent(event.deviceId(), event.property(), event.seq(), event.eventId(), result);
@@ -131,10 +132,7 @@ public class EventIngestService {
             case ACCEPTED -> {
                 // 6) 状态确认成功 -> 评估规则（边沿触发 + 每规则锁，保证并发只触发一次）。
                 List<RuleFireOutcome> outcomes = ruleEngine.onStateConfirmed();
-                String decision = "接受上报并确认状态:" + event.deviceId() + "." + event.property()
-                        + "=" + normalized + " seq=" + event.seq()
-                        + (outcomes.isEmpty() ? "；无规则边沿触发"
-                        : "；触发规则 " + outcomes.stream().map(RuleFireOutcome::ruleId).toList());
+                String decision = buildAcceptedDecision(event, normalized, outcomes);
                 return IngestResult.accepted(event.eventId(), normalized, decision, outcomes);
             }
             default -> throw new IllegalStateException("unknown confirm status: " + confirm.status());
@@ -143,6 +141,38 @@ public class EventIngestService {
 
     private static boolean isBlank(String s) {
         return s == null || s.isBlank();
+    }
+
+    /**
+     * 组装 ACCEPTED 事件的自然语言结论：
+     * 实际触发的规则与“边沿被冷却挡下 / 条件持续满足”的规则分别列出，
+     * 让排查时能一眼区分“条件没到 / 被冷却挡住 / 正常触发”。
+     */
+    private static String buildAcceptedDecision(StateEvent event, Object normalized,
+                                                List<RuleFireOutcome> outcomes) {
+        StringBuilder sb = new StringBuilder("接受上报并确认状态:")
+                .append(event.deviceId()).append('.').append(event.property())
+                .append('=').append(normalized).append(" seq=").append(event.seq());
+        if (outcomes.isEmpty()) {
+            return sb.append("；无规则边沿相关结论（条件未到）").toString();
+        }
+        List<String> fired = outcomes.stream().filter(RuleFireOutcome::fired)
+                .map(o -> o.ruleId() + "(fireNo=" + o.fireNo() + ")").toList();
+        List<String> cooldownBlocked = outcomes.stream().filter(RuleFireOutcome::cooldownBlocked)
+                .map(o -> o.ruleId() + "(剩余约" + o.cooldownRemaining() + "ms)").toList();
+        List<String> stillSatisfied = outcomes.stream()
+                .filter(o -> !o.fired() && !o.cooldownBlocked())
+                .map(RuleFireOutcome::ruleId).toList();
+        if (!fired.isEmpty()) {
+            sb.append("；触发规则 ").append(fired);
+        }
+        if (!cooldownBlocked.isEmpty()) {
+            sb.append("；边沿被冷却挡下 ").append(cooldownBlocked);
+        }
+        if (!stillSatisfied.isEmpty()) {
+            sb.append("；条件持续满足不重复触发 ").append(stillSatisfied);
+        }
+        return sb.toString();
     }
 
     /** 测试/演示重置：清空已处理 eventId 幂等集合。 */

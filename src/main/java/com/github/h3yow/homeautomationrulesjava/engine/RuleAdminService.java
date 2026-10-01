@@ -31,15 +31,21 @@ public class RuleAdminService {
         this.deviceRegistry = deviceRegistry;
     }
 
-    /** 新增规则（默认 version=1），同时校验全部条件与动作。 */
+    /** 新增规则（默认 version=1），同时校验全部条件与动作。cooldownMillis 为 null/<=0 表示不启用冷却。 */
+    public Rule createRule(String id, String name, boolean enabled,
+                           List<Condition> conditions, List<Action> actions, Long cooldownMillis) {
+        validate(conditions, actions);
+        Rule rule = new Rule(id, name, enabled, conditions, actions, 1, cooldownMillis);
+        ruleStore.add(rule);
+        log.info("规则已新增 id={} enabled={} cooldownMillis={} conditions={} actions={}",
+                id, enabled, rule.cooldownMillis(), conditions.size(), actions.size());
+        return rule;
+    }
+
+    /** 兼容旧签名：新增不启用冷却的规则。 */
     public Rule createRule(String id, String name, boolean enabled,
                            List<Condition> conditions, List<Action> actions) {
-        validate(conditions, actions);
-        Rule rule = new Rule(id, name, enabled, conditions, actions, 1);
-        ruleStore.add(rule);
-        log.info("规则已新增 id={} enabled={} conditions={} actions={}", id, enabled,
-                conditions.size(), actions.size());
-        return rule;
+        return createRule(id, name, enabled, conditions, actions, null);
     }
 
     /** 运行中启停，立即对后续事件生效。 */
@@ -59,6 +65,23 @@ public class RuleAdminService {
         Rule updated = current.withDefinition(name, conditions, actions);
         ruleStore.replace(updated);
         log.info("规则 {} 参数已运行中调整 (version={})", ruleId, updated.version());
+        return updated;
+    }
+
+    /**
+     * 运行中调整最短触发间隔（冷却），立即对后续边沿评估生效：
+     * - 调长/调短：下一次 false→true 边沿按新间隔判定；
+     * - 传入 null 或 &lt;=0：关闭冷却，之后仅受边沿语义约束（与历史行为一致）；
+     * - 从关闭改为正数：立即开启，窗口自最近一次实际触发时刻起算。
+     *
+     * 每条规则独立配置、独立计时，互不影响。
+     */
+    public Rule setCooldownMillis(String ruleId, Long cooldownMillis) {
+        Rule current = mustExist(ruleId);
+        Rule updated = current.withCooldownMillis(cooldownMillis);
+        ruleStore.replace(updated);
+        log.info("规则 {} 冷却已运行中调整: {} -> {} ms (version={})",
+                ruleId, current.cooldownMillis(), updated.cooldownMillis(), updated.version());
         return updated;
     }
 

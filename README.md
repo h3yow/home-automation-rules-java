@@ -27,22 +27,68 @@
 - `actions`：多个动作的**有序序列**，动作形如把 `targetDeviceId.property` 设为 `value`。
   每个动作有稳定的 `actionDefId`。
 - `enabled`：启停状态。
-- `version`：每次启停 / 参数调整都产生新版本（+1）。
+- `cooldownMillis`：**最短触发间隔（冷却）**，单位毫秒，可空。
+  - `null`（默认）或 `<=0`：**不启用冷却**，规则行为与历史版本完全一致（纯边沿触发）；
+  - 正整数：一次实际触发后进入冷却窗口，窗口内的 false→true 边沿一律不触发。
+- `version`：每次启停 / 参数调整（含冷却调整）都产生新版本（+1）。
 
-### 1.3 触发语义：边沿触发
+### 1.3 触发语义：边沿触发 + 可选冷却
 
-条件组只有在 **false → true**（由“不满足”变为“满足”）的那一次状态确认时才触发一次：
+条件组只有在 **false → true**（由“不满足”变为“满足”）的那一次状态确认时才有资格触发：
 
-- 条件不满足：不触发，边沿状态保持 false；
-- 越过阈值（false→true）：触发一次，领取单调递增的 `fireNo`；
-- 条件持续满足期间，无论收到多少条（哪怕值不同的）上报，**都不重复触发**；
-- 条件离开（true→false）后重新进入，才会再次触发。
+- 条件不满足：不触发，边沿状态保持 false（事件结果中标注“条件未到”，不产生规则记录）；
+- 越过阈值（false→true）且**不在冷却期**：触发一次，领取单调递增的 `fireNo`；
+- 条件持续满足期间，无论收到多少条（哪怕值不同的）上报，**都不重复触发**
+  （规则结果 `skipReason=STILL_SATISFIED`）；
+- 条件离开（true→false）后重新进入，才会再次获得触发资格。
 
-### 1.4 运行中变更立即生效
+**冷却（cooldownMillis）叠加在边沿之上，规则如下：**
 
-规则的新增、启停、参数（名称/条件/动作）调整都在运行中生效：
-规则以**不可变快照 + volatile 引用**原子替换，在途执行读到的是旧版本，新事件读到新版本，不会出现半更新。
+1. 规则配置了正的 `cooldownMillis` 后，每次**实际触发**都会记录冷却窗口起点；
+2. 起点之后的 `cooldownMillis` 毫秒为冷却期。冷却期内条件即使先离开又再次满足
+   （即真的出现了新的 false→true 边沿，例如温度在阈值附近抖动反复穿越），
+   该次边沿也会被挡下：**不触发、不领取 fireNo、不下发任何动作**，
+   规则结果记为 `skipReason=COOLDOWN_ACTIVE`，并带 `cooldownRemaining`（剩余毫秒）；
+3. **被挡下的边沿不会补发、也不会延后**：冷却到期时系统不会“补一枪”；
+   必须是冷却结束**之后**再出现一次新的 false→true 变化，才允许正常触发
+   （冷却期结束时若条件一直满足，下一条上报只算持续满足，不算边沿）；
+4. 冷却窗口起点**只由“实际触发”刷新**：被冷却挡下不会延长/重置窗口；
+5. 没配置冷却的规则，以上机制完全不介入，行为与旧版本逐字节一致。
+
+> 冷却与边沿可区分：事件判定结果 / `/api/traces/fires` 轨迹中，
+> `COOLDOWN_ACTIVE`（边沿被冷却挡下）、`STILL_SATISFIED`（条件一直满足）、
+> 无规则结果（条件没到）是三种不同结论，排查时一眼可辨。
+
+### 1.4 运行中变更立即生效（含冷却）
+
+规则的新增、启停、参数（名称/条件/动作）、**冷却时间（调长/调短/开启/关闭）**
+调整都在运行中生效：规则以**不可变快照 + volatile 引用**原子替换，在途执行读到的是旧版本，
+新事件读到新版本，不会出现半更新。每次调整 `version` 加一。
+
+- 调长：下一次边沿立即按更长窗口判定（可能立刻被挡）；
+- 调短/关闭：下一次边沿立即按更短窗口或纯边沿判定（可能立刻放行）；
+- 关闭后再开启：立即生效；
+- 冷却窗口起点始终是**最近一次实际触发时刻**，调整配置本身不会移动该起点，
+  因此“从什么时候开始计时”不随配置变更漂移，结果可预测；
+- 每条规则各配各的冷却、各自独立计时，互不影响。
+
 变更前会校验所有条件/动作引用的设备属性是否存在、取值是否合法。
+
+### 1.5 冷却的计时口径（明确、可预测）
+
+- **时钟来源**：统一使用引擎时钟 `EngineClock`（默认即 `System.currentTimeMillis()`
+  的本地墙钟毫秒值）。**不使用事件自带的 `eventTime`**，因此乱序/迟到上报不会改变冷却判定，
+  也不会被客户端时钟影响。
+- **采样点唯一**：在某条规则的串行临界区（每规则一把锁）内、“边沿评估那一刻”只采样一次
+  `now`，冷却检查、`fireNo` 领取、窗口起点记录复用同一个值，临界区内不二次读钟。
+- **判定公式**：设上次实际触发时刻为 `lastFiredAt`，本次边沿评估时刻为 `now`：
+  - `lastFiredAt == 0`（从未触发）→ 立即允许触发；
+  - `now - lastFiredAt >= cooldownMillis` → 允许触发，并把窗口起点刷新为 `now`；
+  - `now - lastFiredAt < cooldownMillis` → 挡下，`cooldownRemaining = cooldownMillis - (now-lastFiredAt)`。
+- 边界按毫秒整数比较，**“等于间隔”即视为冷却结束**（`>=`，半开区间 `[lastFiredAt, lastFiredAt+cooldown)`）。
+- 抖动 / 并发 / 乱序 / 迟到都不会造成时间口径歧义：同一规则的全部判定在同一把锁内按
+  事件确认顺序串行完成；挡下不刷新起点，触发才刷新起点。
+- 测试中可通过注入 `EngineClock.setFixedNow/advance` 使用确定时间断言边界，无需 sleep。
 
 ---
 
@@ -87,8 +133,11 @@ StateEvent { deviceId, property, rawValue, seq, eventId, eventTime }
 ### 2.4 可解释性
 
 每条事件的处理结果 `IngestResult` 都带自然语言 `decision`，规则结果 `RuleFireOutcome`
-带逐动作的 `summary`。服务日志会打印**输入事件**（设备/属性/seq/eventId/值）与**判定依据**
-（哪条条件成立、是边沿还是持续满足、是否判重）。全部轨迹可通过 `/api/traces/**` 查询。
+带逐动作的 `summary`。规则“有边沿相关结论但没触发”时通过 `skipReason` 区分：
+`STILL_SATISFIED`（条件持续满足）与 `COOLDOWN_ACTIVE`（边沿被冷却挡下，附
+`cooldownRemaining`）；条件根本没到则不产生规则记录。服务日志会打印**输入事件**
+（设备/属性/seq/eventId/值）与**判定依据**（哪条条件成立、是边沿还是持续满足、
+是否判重、是否被冷却挡下）。全部轨迹可通过 `/api/traces/**` 查询。
 
 ---
 
@@ -150,16 +199,20 @@ idempotencyKey = ruleId : fireNo : actionDefId
 mvn clean test
 ```
 
-覆盖场景（共 16 个用例，测试日志会打印输入事件与判定依据）：
+覆盖场景（共 22 个用例，测试日志会打印输入事件与判定依据）：
 
 | 测试类 | 覆盖 |
 |--------|------|
 | `StateIngestTest` | 乱序/迟到/同序号/重复上报、状态不回退；未注册设备/非法取值/缺字段拒绝且原因可区分 |
 | `RuleTriggerTest` | 边沿只触发一次、持续满足不重复、离开再进入重新触发；运行中启停与调参立即生效 |
 | `ConcurrentTriggerTest` | 同一事件 16 线程并发只接受一次、动作序列一次；20 个不同事件并发只边沿触发一次 |
+| `CooldownTest` | **冷却抖动抑制（冷却期反复穿越只触发一次、冷却后新边沿不漏触发）；冷却期内 16 线程并发穿越不多触发不多下发；运行中调长/调短/关闭/重开即时生效且各规则独立；不配置冷却默认行为与历史一致；COOLDOWN_ACTIVE 与 STILL_SATISFIED 在事件结果与轨迹中可区分；冷却不影响部分失败补偿，设备状态/动作记录/最终结论三者一致** |
 | `ActionFailureTest` | 瞬时不可达重试成功；永久超时重试耗尽+补偿；不可达与超时原因区分；条件复核失败跳过 |
 | `IdempotencyTest` | 成功后重复/失败后重复/瞬时恢复三种幂等，物理副作用次数可断言 |
 | `ApiIntegrationTest` | HTTP 端到端：查询、拒绝码、触发、动作轨迹 |
+
+> 冷却相关测试全部通过注入式 `EngineClock` 用确定时间驱动（无需 sleep），
+> 动作实际下发次数通过 `ExecutionLog.actionRecords()` 与 `DeviceGateway.physicalValue(...)` 双重断言。
 
 ### 4.2 启动应用并用 curl 复现
 
@@ -214,7 +267,33 @@ curl -s -X PATCH $B/api/rules/rule-cool-down -H 'Content-Type: application/json'
   "conditions":[{"deviceId":"temp-sensor","property":"temperature","operator":"GT","expected":25}],
   "actions":[{"actionDefId":"turn-off-plug","targetDeviceId":"plug","property":"on","value":false}]}'
 
-# 可追溯轨迹：事件判定 / 规则触发 / 动作执行
+# 设置最短触发间隔（冷却）= 10 秒，立即对后续事件生效；响应中可见 cooldownMillis 与新版本号
+curl -s -X PATCH $B/api/rules/rule-cool-down/cooldown -H 'Content-Type: application/json' -d '{"cooldownMillis":10000}'
+
+# 调短 / 调长：再 PATCH 一次即可，例如 1000ms
+curl -s -X PATCH $B/api/rules/rule-cool-down/cooldown -H 'Content-Type: application/json' -d '{"cooldownMillis":1000}'
+
+# 关闭冷却：传 null 或 <=0，之后恢复纯边沿触发（与历史行为一致）
+curl -s -X PATCH $B/api/rules/rule-cool-down/cooldown -H 'Content-Type: application/json' -d '{"cooldownMillis":null}'
+
+# 新建规则时也可直接带 cooldownMillis（省略则默认无冷却）
+curl -s -X POST $B/api/rules -H 'Content-Type: application/json' -d '{
+  "id":"rule-jitter-guard",
+  "name":"抖动保护规则",
+  "enabled":true,
+  "cooldownMillis":5000,
+  "conditions":[{"deviceId":"temp-sensor","property":"temperature","operator":"GT","expected":28}],
+  "actions":[{"actionDefId":"turn-off-plug","targetDeviceId":"plug","property":"on","value":false}]}'
+
+# 冷却期内再次穿越阈值：事件仍 ACCEPTED（状态被确认），但规则结果
+# fired=false、skipReason=COOLDOWN_ACTIVE、cooldownRemaining>0，且动作一次都不会多发；
+# 条件一直满足时则是 skipReason=STILL_SATISFIED，两者可区分。
+curl -s -X POST $B/api/events -H 'Content-Type: application/json' -d '{
+  "deviceId":"temp-sensor","property":"temperature","value":20,"seq":3,"eventId":"e-3","eventTime":300}'
+curl -s -X POST $B/api/events -H 'Content-Type: application/json' -d '{
+  "deviceId":"temp-sensor","property":"temperature","value":33,"seq":4,"eventId":"e-4","eventTime":400}'
+
+# 可追溯轨迹：事件判定 / 规则触发（含 COOLDOWN_ACTIVE、STILL_SATISFIED） / 动作执行
 curl -s $B/api/traces/events
 curl -s $B/api/traces/fires
 curl -s $B/api/traces/actions
@@ -231,16 +310,23 @@ store/    本地内存存储：DeviceRegistry、StateStore（序号单调确认�
           RuleStore（原子快照 + 边沿状态 + fireNo）、ExecutionLog（轨迹）
 device/   DeviceGateway（模拟设备物理副作用与故障注入）、DeviceCommandException
 engine/   EventIngestService（接入/校验/幂等）、ConditionEvaluator（条件判定与解释）、
-          RuleEngine（边沿触发 + 每规则锁 + 补偿编排）、ActionExecutor（幂等/重试/复核/补偿）、
-          RuleAdminService（运行中增删改）
+          RuleEngine（边沿触发 + 每规则锁 + 冷却判定 + 补偿编排）、
+          ActionExecutor（幂等/重试/复核/补偿）、RuleAdminService（运行中增删改与冷却调整）、
+          EngineClock（冷却统一计时口径，默认真实墙钟、测试可注入固定时间）
 api/      REST 控制器与统一异常处理
 config/   演示数据初始化
 ```
 
 ## 6. 设计要点小结
 
-- **顺序无关、重复无害、并发一致**：seq 单调 + eventId 幂等 + 设备/规则双级锁。
-- **结论可区分、可解释、可追溯**：拒绝原因、忽略原因、动作失败原因全部枚举化；
+- **顺序无关、重复无害、并发一致**：seq 单调 + eventId 幂等 + 设备/规则双级锁；
+  冷却判定也在规则临界区内完成，抖动/乱序/并发穿越不多发、不漏发。
+- **抗抖动冷却**：可按规则独立配置最短触发间隔；默认 `null` 完全兼容历史行为；
+  调长/调短/开启/关闭运行中即时生效；窗口只在实际触发时刷新，挡下不刷新、不补发；
+  时间口径统一走引擎时钟在边沿评估时刻的单次采样，明确可预测。
+- **结论可区分、可解释、可追溯**：拒绝原因、忽略原因、动作失败原因、
+  冷却挡下（COOLDOWN_ACTIVE）与持续满足（STILL_SATISFIED）全部枚举化；
   每次判定与执行都有自然语言说明并落入轨迹。
-- **失败安全**：条件复核防止过期执行；有界重试只针对可恢复故障；补偿回滚已成功副作用；
+- **失败安全**：条件复核防止过期执行；有界重试只针对可恢复故障；补偿回滚已成功副作用，
+  且补偿结果同步回填动作轨迹（设备状态、动作记录、最终结论三者一致）；
   补偿失败明确要求人工介入，绝不静默吞错。
