@@ -12,8 +12,15 @@ import java.util.Objects;
  */
 public final class DeviceState {
 
-    /** 单个属性的已确认值及其确认元数据。 */
-    public record ConfirmedProperty(Object value, long lastSeq, long confirmedAt) {
+    /**
+     * 单个属性的已确认值及其确认元数据。
+     *
+     * @param lastSeq     上报序号空间内的高水位（仅在来源为上报时有意义；动作回写不占用上报序号）
+     * @param reportEpoch 该属性“已确认上报”的纪元计数：每次被上报确认推进就 +1，
+     *                    动作下发/回滚回写不改变它。回滚时据此判断触发后是否有新的上报已确认，
+     *                    避免一次回滚把已经确认的新状态盖回旧值。
+     */
+    public record ConfirmedProperty(Object value, long lastSeq, long confirmedAt, long reportEpoch) {
     }
 
     private final String deviceId;

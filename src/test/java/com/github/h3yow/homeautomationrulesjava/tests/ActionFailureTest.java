@@ -134,7 +134,7 @@ class ActionFailureTest {
         assertEquals(ActionFailureReason.EXECUTION_TIMEOUT, lockRec.failureReason());
         assertEquals(3, lockRec.attempts(), "重试上限为 3");
 
-        // 此前成功动作被补偿（plug 回滚为触发前的 null，即没有任何残留副作用）。
+        // 此前成功动作被补偿（plug 回滚为触发前原值 true）。
         assertTrue(fire.partiallyFailed());
         assertTrue(plugRec.compensated(), "已成功的 plug 动作必须被补偿");
         // lock 从未成功，物理侧无残留；plug 已补偿回滚。

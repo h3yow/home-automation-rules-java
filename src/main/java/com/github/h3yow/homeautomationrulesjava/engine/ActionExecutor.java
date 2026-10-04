@@ -6,8 +6,10 @@ import com.github.h3yow.homeautomationrulesjava.model.Action;
 import com.github.h3yow.homeautomationrulesjava.model.ActionExecutionRecord;
 import com.github.h3yow.homeautomationrulesjava.model.ActionFailureReason;
 import com.github.h3yow.homeautomationrulesjava.model.ActionStatus;
+import com.github.h3yow.homeautomationrulesjava.model.CompensationStatus;
 import com.github.h3yow.homeautomationrulesjava.model.Condition;
 import com.github.h3yow.homeautomationrulesjava.model.Device;
+import com.github.h3yow.homeautomationrulesjava.model.DeviceState;
 import com.github.h3yow.homeautomationrulesjava.model.PropertySpec;
 import com.github.h3yow.homeautomationrulesjava.store.DeviceRegistry;
 import com.github.h3yow.homeautomationrulesjava.store.ExecutionLog;
@@ -20,7 +22,6 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -34,7 +35,15 @@ import java.util.concurrent.ConcurrentHashMap;
  *   CONDITION_RECHECK_FAILED 属语义失效，立即终止不重试。
  * - 执行前复核条件：若规则条件在动作下发瞬间已不成立，跳过该动作并标记原因，
  *   防止对过期结论下发命令。
- * - 动作失败后执行补偿（把此前本序列已成功的动作回滚为原值），补偿本身也幂等。
+ *
+ * 补偿（回滚）语义：
+ * - 动作序列中途失败后，把本序列此前已成功动作涉及的属性恢复为“触发前那一刻的原值”，
+ *   包括触发前该设备本来就没有该属性值的情况（恢复后查询侧该属性不存在）；
+ * - 同一 (设备,属性) 在本序列里被多个动作先后改过，也只回滚一次、直接恢复为触发前原值；
+ * - 回滚通过 StateStore 的 CAS（reportEpoch）完成：触发后若已有新的上报被确认，回滚跳过，
+ *   绝不把已确认的新状态盖回旧值（返回 SUPERSEDED_BY_NEW_REPORT）；
+ * - 回滚成功时物理侧与查询侧状态同步恢复；回滚失败或拿不到触发前原值时返回明确状态，
+ *   绝不表现为“已恢复”。补偿本身幂等。
  */
 @Component
 public class ActionExecutor {
@@ -54,8 +63,10 @@ public class ActionExecutor {
     private final Map<String, ActionExecutionRecord> finishedRecords = new ConcurrentHashMap<>();
     /** 正在执行中的键，用于并发调用时等待首个执行完成。 */
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
-    /** 已完成补偿的键，保证补偿幂等不重复。 */
-    private final Set<String> compensatedKeys = ConcurrentHashMap.newKeySet();
+    /** 已完成补偿的 (fireKey,设备,属性) -> 补偿结果，保证补偿幂等、同一属性只回滚一次。 */
+    private final Map<String, CompensationStatus> compensated = new ConcurrentHashMap<>();
+    /** 补偿去重键对应的执行锁。 */
+    private final Map<String, Object> compensateLocks = new ConcurrentHashMap<>();
 
     @Autowired
     public ActionExecutor(DeviceGateway gateway, DeviceRegistry deviceRegistry, StateStore stateStore,
@@ -84,8 +95,7 @@ public class ActionExecutor {
      */
     public ActionExecutionRecord execute(String idempotencyKey, Action action,
                                          List<Condition> recheckConditions,
-                                         Map<String, com.github.h3yow.homeautomationrulesjava.model.DeviceState>
-                                                 preActionSnapshots) {
+                                         Map<String, DeviceState> preActionSnapshots) {
         ActionExecutionRecord cached = finishedRecords.get(idempotencyKey);
         if (cached != null) {
             log.info("动作幂等命中，直接复用结果 key={} status={}", idempotencyKey, cached.status());
@@ -106,15 +116,13 @@ public class ActionExecutor {
 
     private ActionExecutionRecord doExecute(String key, Action action,
                                             List<Condition> recheckConditions,
-                                            Map<String, com.github.h3yow.homeautomationrulesjava.model.DeviceState>
-                                                    preActionSnapshots) {
+                                            Map<String, DeviceState> preActionSnapshots) {
         // 1) 动作值合法性校验（非法动作值不应进入下发）。
         try {
             validateActionValue(action);
         } catch (IllegalArgumentException ex) {
             return finish(key, action, ActionStatus.FAILED, 0,
-                    ActionFailureReason.INVALID_ACTION, false,
-                    List.of("invalid action value: " + ex.getMessage()));
+                    ActionFailureReason.INVALID_ACTION, List.of("invalid action value: " + ex.getMessage()));
         }
 
         // 2) 执行前条件复核：条件已失效则跳过，不下发。
@@ -122,7 +130,7 @@ public class ActionExecutor {
             String detail = "条件复核失败，动作跳过: " + evaluator.evaluate(recheckConditions).describe();
             log.info("key={} {}", key, detail);
             return finish(key, action, ActionStatus.SKIPPED, 0,
-                    ActionFailureReason.CONDITION_RECHECK_FAILED, false, List.of(detail));
+                    ActionFailureReason.CONDITION_RECHECK_FAILED, List.of(detail));
         }
 
         // 3) 带重试下发（幂等键透传给网关）。
@@ -134,10 +142,10 @@ public class ActionExecutor {
                 gateway.sendCommand(key, action.targetDeviceId(), action.property(), action.value());
                 log.info("动作下发成功 key={} attempt={} -> {}={}",
                         key, i, action.targetDeviceId(), action.property(), action.value());
-                // 物理副作用成功，回写为已确认状态（用单调时间戳派生 seq 空间与上报独立）。
+                // 物理副作用成功，回写为已确认状态（不占用上报序号、不推进 reportEpoch）。
                 stateStore.applyCommand(action.targetDeviceId(), action.property(), action.value(),
                         System.currentTimeMillis());
-                return finish(key, action, ActionStatus.SUCCESS, attempts, null, false, List.of());
+                return finish(key, action, ActionStatus.SUCCESS, attempts, null, List.of());
             } catch (DeviceCommandException ex) {
                 errors.add("attempt " + i + " -> " + ex.reason() + ": " + ex.getMessage());
                 log.warn("动作下发失败 key={} attempt={} reason={}", key, i, ex.reason());
@@ -147,40 +155,88 @@ public class ActionExecutor {
             }
         }
         ActionFailureReason finalReason = dominantReason(errors);
-        return finish(key, action, ActionStatus.FAILED, attempts, finalReason, false, errors);
+        return finish(key, action, ActionStatus.FAILED, attempts, finalReason, errors);
     }
 
     /**
-     * 补偿：把动作目标属性恢复为触发前快照中的原值。幂等。
-     * 用于部分失败时回滚本触发实例内已成功的动作。
+     * 补偿：把动作目标属性恢复为触发前快照中的原值。幂等；同一 (fireKey,设备,属性) 只恢复一次。
+     * 用于部分失败时回滚本触发实例内已成功的动作（同设备多动作先后改动时按属性去重）。
+     *
+     * @return 补偿的最终状态，绝不允许在未恢复时返回 RESTORED
      */
-    public boolean compensate(String fireKey, Action action,
-                              Map<String, com.github.h3yow.homeautomationrulesjava.model.DeviceState> preSnapshots) {
-        String compKey = "comp:" + fireKey + ":" + action.actionDefId();
-        if (!compensatedKeys.add(compKey)) {
-            log.info("补偿幂等命中，跳过 key={}", compKey);
-            return true;
+    public CompensationStatus compensate(String fireKey, Action action, Map<String, DeviceState> preSnapshots) {
+        String deviceId = action.targetDeviceId();
+        String property = action.property();
+        String dedupeKey = fireKey + ":" + deviceId + ":" + property;
+        CompensationStatus existing = compensated.get(dedupeKey);
+        if (existing != null) {
+            log.info("补偿幂等命中，复用结果 key={} status={}", dedupeKey, existing);
+            return existing;
         }
-        var pre = preSnapshots.get(action.targetDeviceId());
-        Object original = pre == null ? null : pre.valueOf(action.property());
-        if (original == null) {
-            log.info("无触发前原值可回滚 key={} {}={}", compKey, action.targetDeviceId(), action.property());
-            return true;
-        }
-        try {
-            gateway.sendCommand(compKey, action.targetDeviceId(), action.property(), original);
-            log.info("补偿成功 key={} 回滚 {}={}", compKey, action.targetDeviceId(), action.property(), original);
-            return true;
-        } catch (DeviceCommandException ex) {
-            log.error("补偿失败 key={} reason={}", compKey, ex.reason());
-            return false;
+        Object monitor = compensateLocks.computeIfAbsent(dedupeKey, k -> new Object());
+        synchronized (monitor) {
+            existing = compensated.get(dedupeKey);
+            if (existing != null) {
+                return existing;
+            }
+            CompensationStatus status = doCompensate(fireKey, action, preSnapshots, dedupeKey);
+            compensated.put(dedupeKey, status);
+            return status;
         }
     }
 
-    /** 供记录补偿结果：把某动作记录标记为已补偿。 */
-    public ActionExecutionRecord markCompensated(ActionExecutionRecord rec) {
+    private CompensationStatus doCompensate(String fireKey, Action action,
+                                            Map<String, DeviceState> preSnapshots, String dedupeKey) {
+        String deviceId = action.targetDeviceId();
+        String property = action.property();
+        String compKey = "comp:" + fireKey + ":" + property;
+
+        DeviceState pre = preSnapshots.get(deviceId);
+        // 触发前目标设备没有任何已确认快照：拿不到触发前原值，不能声称已恢复。
+        if (pre == null) {
+            log.error("无法补偿 key={}：触发前设备 {} 无快照，拿不到原值，需人工介入", compKey, deviceId);
+            return CompensationStatus.ORIGINAL_UNAVAILABLE;
+        }
+        DeviceState.ConfirmedProperty original = pre.get(property);
+        boolean originalPresent = original != null;
+        Object originalValue = originalPresent ? original.value() : null;
+        long expectedEpoch = originalPresent ? original.reportEpoch() : 0L;
+
+        StateStore.RestoreResult result = stateStore.restoreIfNoNewReport(
+                deviceId, property, expectedEpoch, originalPresent, originalValue,
+                System.currentTimeMillis(),
+                () -> {
+                    // 物理侧恢复与查询侧 CAS 在同一设备临界区内完成，避免并发上报时互相覆盖。
+                    if (originalPresent) {
+                        gateway.sendCommand(compKey, deviceId, property, originalValue);
+                    } else {
+                        gateway.clearPhysical(compKey, deviceId, property);
+                    }
+                });
+
+        switch (result.status()) {
+            case RESTORED -> {
+                log.info("补偿成功 key={} {}={} 恢复为触发前原值(present={})",
+                        compKey, deviceId, property, originalPresent ? originalValue : "<absent>", originalPresent);
+                return CompensationStatus.RESTORED;
+            }
+            case SUPERSEDED_BY_NEW_REPORT -> {
+                log.info("补偿跳过 key={} {}={}：触发后已有新的上报被确认，保留新状态不回滚",
+                        compKey, deviceId, property);
+                return CompensationStatus.SUPERSEDED_BY_NEW_REPORT;
+            }
+            case FAILED -> {
+                log.error("补偿失败 key={} {}={}：物理回滚命令失败，需人工介入", compKey, deviceId, property);
+                return CompensationStatus.FAILED;
+            }
+            default -> throw new IllegalStateException("unknown restore status: " + result.status());
+        }
+    }
+
+    /** 供记录补偿结果：把某动作记录的补偿状态更新为最终值。 */
+    public ActionExecutionRecord markCompensation(ActionExecutionRecord rec, CompensationStatus status) {
         return new ActionExecutionRecord(rec.idempotencyKey(), rec.action(), rec.status(), rec.attempts(),
-                rec.failureReason(), true, rec.errors());
+                rec.failureReason(), status, rec.errors());
     }
 
     private void validateActionValue(Action action) {
@@ -217,15 +273,16 @@ public class ActionExecutor {
     }
 
     private ActionExecutionRecord finish(String key, Action action, ActionStatus status, int attempts,
-                                         ActionFailureReason reason, boolean compensated, List<String> errors) {
-        return new ActionExecutionRecord(key, action, status, attempts, reason, compensated,
-                List.copyOf(errors));
+                                         ActionFailureReason reason, List<String> errors) {
+        return new ActionExecutionRecord(key, action, status, attempts, reason,
+                CompensationStatus.NOT_NEEDED, List.copyOf(errors));
     }
 
     /** 测试/演示重置：清空幂等结果缓存、执行锁与补偿记录。 */
     public void reset() {
         finishedRecords.clear();
         locks.clear();
-        compensatedKeys.clear();
+        compensated.clear();
+        compensateLocks.clear();
     }
 }

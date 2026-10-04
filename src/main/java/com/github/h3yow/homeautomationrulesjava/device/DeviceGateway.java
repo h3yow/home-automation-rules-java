@@ -38,6 +38,9 @@ public class DeviceGateway {
     private final Map<String, Fault> faults = new ConcurrentHashMap<>();
     /** 幂等键 -> 是否已成功执行过物理副作用。 */
     private final Set<String> executedKeys = ConcurrentHashMap.newKeySet();
+    /** 真实成功改变物理侧的命令次数（不含失败尝试与幂等短路），供断言下发次数。 */
+    private final java.util.concurrent.atomic.AtomicInteger successfulCommandCount =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     private static String faultKey(String deviceId, String property) {
         return deviceId + "#" + property;
@@ -96,6 +99,36 @@ public class DeviceGateway {
         }
         // 唯一一次真实副作用。
         physicalState.put(physicalKey(deviceId, property), value);
+        successfulCommandCount.incrementAndGet();
+    }
+
+    /**
+     * 清除设备物理侧属性（模拟“复位/移除”），用于回滚到“触发前该属性本来没有值”的状态。
+     * 幂等语义与 {@link #sendCommand} 相同：同一幂等键只产生一次物理副作用。
+     *
+     * @throws DeviceCommandException 与下发命令相同的可区分故障
+     */
+    public void clearPhysical(String idempotencyKey, String deviceId, String property) {
+        Objects.requireNonNull(idempotencyKey, "idempotencyKey");
+        if (!executedKeys.add(idempotencyKey)) {
+            return;
+        }
+        Fault fault = faults.get(faultKey(deviceId, property));
+        if (fault != null && fault.remaining > 0) {
+            if (fault.remaining != Integer.MAX_VALUE) {
+                fault.remaining--;
+            }
+            executedKeys.remove(idempotencyKey);
+            throw new DeviceCommandException(fault.reason,
+                    "clear command to " + deviceId + "." + property + " failed: " + fault.reason);
+        }
+        physicalState.remove(physicalKey(deviceId, property));
+        successfulCommandCount.incrementAndGet();
+    }
+
+    /** 测试辅助：真实成功改变物理侧的命令次数（含回滚命令），不含失败尝试/幂等短路。 */
+    public int successfulCommandCount() {
+        return successfulCommandCount.get();
     }
 
     /** 测试辅助：统计设备物理侧被写入的属性数量。 */
@@ -108,5 +141,6 @@ public class DeviceGateway {
         physicalState.clear();
         faults.clear();
         executedKeys.clear();
+        successfulCommandCount.set(0);
     }
 }

@@ -84,6 +84,7 @@ public class EventController {
             m.put("attempts", r.attempts());
             m.put("failureReason", r.failureReason());
             m.put("compensated", r.compensated());
+            m.put("compensationStatus", r.compensationStatus());
             m.put("errors", r.errors());
             return m;
         }).toList();

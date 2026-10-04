@@ -118,8 +118,10 @@ StateEvent { deviceId, property, rawValue, seq, eventId, eventTime }
 
 ### 2.3 三条一致性保证
 
-1. **已确认状态不回退**：每个「设备 + 属性」独立维护 `lastSeq`，
-   只有 `seq > lastSeq` 才更新；乱序、迟到、同序号上报一律忽略，状态停留在高水位。
+1. **已确认状态不回退**：每个「设备 + 属性」独立维护上报高水位 `lastReportSeq`，
+   只有 `seq > lastReportSeq` 才更新；乱序、迟到、同序号上报一律忽略，状态停留在高水位。
+   上报序号空间与动作回写隔离：动作下发/回滚不占用上报序号，设备在动作之后产生的真实上报
+   不会被误判为乱序；
 2. **重复上报不重复触发**：eventId 去重集合使用并发结构，同一事件并发重复投递只有一个线程通过；
    其余全部得到 `IGNORED/DUPLICATE_EVENT`。
 3. **并发只触发一次动作序列**：每台设备一把锁做「比较并确认」，每条规则一把锁做
@@ -177,17 +179,62 @@ idempotencyKey = ruleId : fireNo : actionDefId
 - 瞬时故障（注入「失败 N 次后恢复」）会在重试内成功，且 `attempts` 可断言、副作用仍只一次；
 - 重试耗尽后失败定论被缓存，同键的再次调用不会重新尝试，杜绝任何潜在重复副作用。
 
-### 3.5 部分失败与补偿
+### 3.5 部分失败与补偿（回滚）
 
 动作序列按序执行，任一动作失败或条件失效：
 
 1. **立即停止**后续动作（前置动作失败后不会继续下发）；
-2. **逆序补偿**本序列此前已成功的动作：把对应属性回滚为「触发前快照」中的原值；
-3. 补偿本身也带幂等键（`comp:...`），重复补偿不会二次生效；
-4. 返回整体结论 `PARTIAL-FAILURE`，逐动作列出状态、尝试次数、失败原因、是否已补偿；
-   若补偿也失败，summary 明确提示需要人工介入。
+2. **逆序补偿**本序列此前已成功的动作：把对应属性回滚为「触发前那一刻快照」中的原值；
+3. 补偿本身也带幂等键（`comp:...`），重复补偿不会二次生效。
 
 触发前快照同时覆盖**条件设备**（复核用）与**动作目标设备**（补偿取原值用）。
+
+#### 3.5.1 回滚恢复的是什么值
+
+- 恢复的永远是**触发前那一刻**该属性的原值，而不是“上一条动作的值”：
+  - 触发前 `light.brightness=40`，序列先下发 80、再下发 20，随后失败——回滚后直接恢复成 **40**，
+    不会停在 80，也不会先回 80 再回 40；
+  - **同一台设备在这条规则里被多个动作先后改过**同一个属性时，该属性只回滚**一次**，
+    直接恢复为触发前原值；涉及该属性的每一条动作记录都会标成同一补偿结果；
+  - **触发前该设备本来就没有这个属性值**（查询侧不存在该属性）时，回滚会把它恢复为“无值”：
+    物理侧执行复位/清除，查询侧快照中该属性也随之消失，而不是残留一个默认值（如 `false`/`0`）。
+
+#### 3.5.2 设备状态、动作记录、最终结论三者如何对应
+
+每条被回滚的动作记录带可区分的 `compensationStatus`（`/api/traces/actions` 同时返回
+兼容字段 `compensated`，它只在真正恢复成功时为 true）：
+
+| compensationStatus | 含义 | 查询侧设备状态 | 物理侧 | summary 措辞 |
+|---|---|---|---|---|
+| `RESTORED` | 已恢复为触发前原值 | 等于触发前原值（或缺值属性消失） | 已回滚（仅一次） | `system rolled back to pre-fire state` |
+| `SUPERSEDED_BY_NEW_REPORT` | 触发后已有更新的设备上报被确认，回滚有意让位、不下发 | 保留那个**更新的已确认值** | 不下发回滚命令 | 明确说明回滚让位给更新的已确认上报 |
+| `FAILED` | 回滚命令下发失败 | **仍停留在被动作改成的值** | 未回滚 | 明确写 `SOME COMPENSATION DID NOT RESTORE ... manual intervention needed` |
+| `ORIGINAL_UNAVAILABLE` | 拿不到触发前原值（触发前无该设备快照） | 保持动作改成的值不变 | 不下发 | 同上，要求人工介入 |
+| `NOT_NEEDED` | 该动作未成功或整条序列成功 | — | — | 不标注 |
+
+**铁律：只有 `RESTORED` 才允许表现为“已经恢复到原值”。** 回滚失败、拿不到原值时，
+查询状态、动作记录、最终结论三处都必须一致地呈现“未恢复、需人工介入”，绝不出现
+“结论说已回滚、查到的状态却还是被改过的值”这类错位。
+
+#### 3.5.3 回滚与上报几乎同时发生时谁算数
+
+回滚通过状态存储的 **CAS（compare-and-swap）+ reportEpoch** 完成：每个属性单独维护一个
+“已确认上报纪元”，只有**上报确认**会推进它，动作下发/回滚回写都不推进。回滚时在设备锁内
+先比较纪元、再下发物理回滚命令并同步查询状态，与并发上报线性一致：
+
+- **回滚先发生、之后才进来新的上报**：回滚正常恢复为原值；随后到达的上报照常确认，
+  最终查询到的是那个新值（合法：原值 → 新值，没有丢状态）；
+- **新上报先被确认、回滚才执行**：纪元已变，回滚整体跳过（连物理命令都不下发），
+  动作记录标 `SUPERSEDED_BY_NEW_REPORT`，最终状态保留更新的已确认值——
+  **一次回滚绝不会把已经确认的新状态又盖回旧值**；
+- 动作下发**之后**设备产生的真实上报不会被误判为“乱序”丢弃：动作回写不占用上报序号空间。
+
+> 冷却与回滚相互正交：没有配置冷却的规则，上述回滚行为与配了冷却的规则完全一致。
+
+#### 3.5.4 整体结论
+
+返回整体结论 `PARTIAL-FAILURE`，逐动作列出状态、尝试次数、失败原因、补偿状态（见上表）；
+存在 `FAILED` / `ORIGINAL_UNAVAILABLE` 时 summary 明确提示需要人工介入，且不会声称已回滚。
 
 ---
 
@@ -199,15 +246,16 @@ idempotencyKey = ruleId : fireNo : actionDefId
 mvn clean test
 ```
 
-覆盖场景（共 22 个用例，测试日志会打印输入事件与判定依据）：
+覆盖场景（共 30 个用例，测试日志会打印输入事件与判定依据）：
 
 | 测试类 | 覆盖 |
 |--------|------|
 | `StateIngestTest` | 乱序/迟到/同序号/重复上报、状态不回退；未注册设备/非法取值/缺字段拒绝且原因可区分 |
-| `RuleTriggerTest` | 边沿只触发一次、持续满足不重复、离开再进入重新触发；运行中启停与调参立即生效 |
+| `RuleTriggerTest` | 边沿触发一次、持续满足不重复、离开再进入重新触发；运行中启停与调参立即生效 |
 | `ConcurrentTriggerTest` | 同一事件 16 线程并发只接受一次、动作序列一次；20 个不同事件并发只边沿触发一次 |
 | `CooldownTest` | **冷却抖动抑制（冷却期反复穿越只触发一次、冷却后新边沿不漏触发）；冷却期内 16 线程并发穿越不多触发不多下发；运行中调长/调短/关闭/重开即时生效且各规则独立；不配置冷却默认行为与历史一致；COOLDOWN_ACTIVE 与 STILL_SATISFIED 在事件结果与轨迹中可区分；冷却不影响部分失败补偿，设备状态/动作记录/最终结论三者一致** |
 | `ActionFailureTest` | 瞬时不可达重试成功；永久超时重试耗尽+补偿；不可达与超时原因区分；条件复核失败跳过 |
+| `RollbackConsistencyTest` | **中途失败回滚后“下发次数/查询状态/动作记录/最终结论”四者一致；触发前原值缺失回滚为无值；回滚失败如实呈现不谎称已恢复；同一设备多动作只回滚一次回到触发前原值；回滚与新上报竞争（确定性用例 + 200 轮多线程竞速）时最终状态只能是原值或更新的已确认值、补偿状态与状态/物理命令次数一致不错位；拿不到触发前快照为 ORIGINAL_UNAVAILABLE；无冷却规则回滚行为一致** |
 | `IdempotencyTest` | 成功后重复/失败后重复/瞬时恢复三种幂等，物理副作用次数可断言 |
 | `ApiIntegrationTest` | HTTP 端到端：查询、拒绝码、触发、动作轨迹 |
 
@@ -255,6 +303,44 @@ curl -s -X POST $B/api/test/faults -H 'Content-Type: application/json' -d '{
 curl -s -X POST $B/api/events -H 'Content-Type: application/json' -d '{
   "deviceId":"temp-sensor","property":"temperature","value":33,
   "seq":2,"eventId":"e-2","eventTime":200}'
+
+# 回滚后三方对账（结论说已回滚，则下面三处必须对得上）：
+# 1) 查到的设备状态：plug 没有被规则改之前没有显式预置值，故回滚后 confirmed 中不应出现 on
+#    （若先用动作/上报把 plug.on 预置为 true，回滚后这里应查到 true，即触发前原值）。
+curl -s $B/api/devices/plug/state
+# 物理侧结论与动作记录：turn-off-plug 为 RESTORED（compensated=true），
+# lock-door 为 FAILED/NOT_NEEDED，attempts=3；compensationStatus 可区分
+# RESTORED / SUPERSEDED_BY_NEW_REPORT / FAILED / ORIGINAL_UNAVAILABLE。
+curl -s $B/api/traces/actions
+# 最终结论：PARTIAL-FAILURE 且末尾写 “system rolled back to pre-fire state”。
+curl -s $B/api/traces/fires
+
+# 边界一：触发前原值缺失。新建规则先把“本来没有值”的 light.brightness 改成 80，随后 lock 失败；
+# 回滚后 /api/devices/light/state 的 confirmed 中不应再有 brightness（恢复为无值）。
+curl -s -X POST $B/api/rules -H 'Content-Type: application/json' -d '{
+  "id":"rule-rb-absent",
+  "name":"原值缺失回滚验证",
+  "enabled":true,
+  "conditions":[{"deviceId":"temp-sensor","property":"temperature","operator":"GT","expected":30}],
+  "actions":[{"actionDefId":"set-brightness","targetDeviceId":"light","property":"brightness","value":80},
+             {"actionDefId":"lock-door","targetDeviceId":"lock","property":"locked","value":true}]}'
+# 让温度先下去再重新越阈值（离开再进入产生新边沿），触发该规则后查状态/记录/结论：
+curl -s -X POST $B/api/events -H 'Content-Type: application/json' -d '{
+  "deviceId":"temp-sensor","property":"temperature","value":20,"seq":3,"eventId":"e-3","eventTime":300}'
+curl -s -X POST $B/api/events -H 'Content-Type: application/json' -d '{
+  "deviceId":"temp-sensor","property":"temperature","value":34,"seq":4,"eventId":"e-4","eventTime":400}'
+curl -s $B/api/devices/light/state
+curl -s $B/api/traces/actions
+
+# 边界二：回滚失败。plug 动作成功后若回滚目标也持续故障（例如回滚前对 plug 注入永久不可达），
+# 补偿命令失败：/api/devices/plug/state 仍是被改成的值，动作记录 compensationStatus=FAILED
+# （compensated=false），结论末尾不会出现 rolled back，而是提示 manual intervention needed。
+curl -s -X POST $B/api/test/faults -H 'Content-Type: application/json' -d '{
+  "deviceId":"plug","property":"on","reason":"DEVICE_UNREACHABLE"}'
+
+# 边界三：回滚让位新上报。在动作成功后、回滚前如果有更新的 plug.on 上报被确认，
+# 回滚整体跳过、不下发：记录为 SUPERSEDED_BY_NEW_REPORT（compensated=false），
+# /api/devices/plug/state 保留那个更新的已确认值，结论中会说明回滚让位给新上报。
 
 # 设备恢复
 curl -s -X POST $B/api/test/recover -H 'Content-Type: application/json' -d '{
@@ -306,12 +392,12 @@ curl -s $B/api/traces/actions
 ```
 model/    领域模型：Device/PropertySpec/DeviceState/StateEvent、Rule/Condition/Action、
           各类结果与可区分原因枚举（RejectReason/IgnoreReason/ActionFailureReason）
-store/    本地内存存储：DeviceRegistry、StateStore（序号单调确认）、
-          RuleStore（原子快照 + 边沿状态 + fireNo）、ExecutionLog（轨迹）
-device/   DeviceGateway（模拟设备物理副作用与故障注入）、DeviceCommandException
+store/    本地内存存储：DeviceRegistry、StateStore（上报序号单调确认 + 动作回写隔离 +
+          reportEpoch CAS 回滚）、RuleStore（原子快照 + 边沿状态 + fireNo）、ExecutionLog（轨迹）
+device/   DeviceGateway（模拟设备物理副作用与故障注入、含复位清除）、DeviceCommandException
 engine/   EventIngestService（接入/校验/幂等）、ConditionEvaluator（条件判定与解释）、
           RuleEngine（边沿触发 + 每规则锁 + 冷却判定 + 补偿编排）、
-          ActionExecutor（幂等/重试/复核/补偿）、RuleAdminService（运行中增删改与冷却调整）、
+          ActionExecutor（幂等/重试/复核/CAS 补偿）、RuleAdminService（运行中增删改与冷却调整）、
           EngineClock（冷却统一计时口径，默认真实墙钟、测试可注入固定时间）
 api/      REST 控制器与统一异常处理
 config/   演示数据初始化
@@ -328,5 +414,8 @@ config/   演示数据初始化
   冷却挡下（COOLDOWN_ACTIVE）与持续满足（STILL_SATISFIED）全部枚举化；
   每次判定与执行都有自然语言说明并落入轨迹。
 - **失败安全**：条件复核防止过期执行；有界重试只针对可恢复故障；补偿回滚已成功副作用，
-  且补偿结果同步回填动作轨迹（设备状态、动作记录、最终结论三者一致）；
-  补偿失败明确要求人工介入，绝不静默吞错。
+  回滚恢复的是触发前原值（含原值缺失恢复为无值、同设备多动作按属性去重只回一次），
+  并通过 reportEpoch CAS 保证回滚不覆盖触发后已确认的新上报；
+  补偿结果（RESTORED/SUPERSEDED/FAILED/ORIGINAL_UNAVAILABLE）同步回填动作轨迹，
+  物理侧、查询侧设备状态、动作记录、最终结论四者一致；只有真正恢复成功才说已恢复，
+  回滚失败/拿不到原值明确要求人工介入，绝不静默吞错或谎称已回滚。

@@ -2,6 +2,7 @@ package com.github.h3yow.homeautomationrulesjava.engine;
 
 import com.github.h3yow.homeautomationrulesjava.model.Action;
 import com.github.h3yow.homeautomationrulesjava.model.ActionExecutionRecord;
+import com.github.h3yow.homeautomationrulesjava.model.CompensationStatus;
 import com.github.h3yow.homeautomationrulesjava.model.DeviceState;
 import com.github.h3yow.homeautomationrulesjava.model.Rule;
 import com.github.h3yow.homeautomationrulesjava.model.RuleFireOutcome;
@@ -13,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,7 +29,10 @@ import java.util.concurrent.ConcurrentHashMap;
  *   COOLDOWN_ACTIVE 挡下（不补发、不延后），窗口结束后需重新出现一次 false→true 边沿才再次触发；
  *   未配置冷却的规则行为与纯边沿触发完全一致；
  * - 动作序列按序执行；任一动作失败/条件失效即停止后续动作，并补偿本序列已成功动作；
- * - 整体结果逐动作可解释，成功/失败原因/补偿状态/冷却挡下都进入执行日志。
+ *   补偿按 (设备,属性) 去重，恢复为触发前原值（含原值缺失恢复为无值），
+ *   触发后已有新上报确认时让位（不覆盖新状态），失败/拿不到原值时如实标记、绝不谎称已恢复；
+ * - 整体结果逐动作可解释，成功/失败原因/补偿状态/冷却挡下都进入执行日志，
+ *   物理侧、查询侧设备状态、动作记录、最终结论四者一致。
  */
 @Component
 public class RuleEngine {
@@ -157,9 +162,8 @@ public class RuleEngine {
                         rule.id(), fireNo, action.actionDefId(), rec.status(), rec.failureReason());
 
                 // 补偿此前已成功动作，保证部分失败时系统收敛且无重复副作用。
-                List<ActionExecutionRecord> compensated = compensateSucceeded(
-                        rule.id(), fireNo, succeeded, preSnapshots, records);
-                String summary = buildPartialSummary(rule, fireNo, records, compensated, rec);
+                compensateSucceeded(rule.id(), fireNo, succeeded, preSnapshots, records);
+                String summary = buildPartialSummary(rule, fireNo, records, rec);
                 return RuleFireOutcome.fired(
                         rule.id(), rule.version(), fireNo, List.copyOf(records), summary);
             }
@@ -176,32 +180,50 @@ public class RuleEngine {
         }
     }
 
-    private List<ActionExecutionRecord> compensateSucceeded(
+    /**
+     * 逆序补偿本序列此前已成功的动作。
+     *
+     * <p>按 (设备,属性) 去重：同一设备的同一属性在一条规则里被多个动作先后改过时，只回滚一次、
+     * 直接恢复为触发前原值；该属性对应的所有成功动作记录统一标记为同一补偿状态。</p>
+     *
+     * <p>补偿结果就地回填到 allRecords（并同步替换执行轨迹），保证动作执行记录、可查询设备状态
+     * 与最终结论三者一致。</p>
+     */
+    private void compensateSucceeded(
             String ruleId, long fireNo, List<ActionExecutionRecord> succeeded,
             Map<String, DeviceState> preSnapshots, List<ActionExecutionRecord> allRecords) {
-        List<ActionExecutionRecord> compensated = new ArrayList<>();
         String fireKey = ruleId + ":" + fireNo;
-        // 逆序补偿更接近“撤销”语义。
+
+        // 属性组 -> 该组所有成功记录（按成功顺序收集）。逆序遍历保证补偿动作的尝试顺序是逆序的。
+        Map<String, List<ActionExecutionRecord>> groups = new LinkedHashMap<>();
         for (int i = succeeded.size() - 1; i >= 0; i--) {
             ActionExecutionRecord rec = succeeded.get(i);
-            boolean ok = actionExecutor.compensate(fireKey, rec.action(), preSnapshots);
-            if (ok) {
+            String groupKey = rec.action().targetDeviceId() + "#" + rec.action().property();
+            groups.computeIfAbsent(groupKey, k -> new ArrayList<>()).add(rec);
+        }
+
+        for (List<ActionExecutionRecord> group : groups.values()) {
+            // 组内记录指向同一 (设备,属性)，补偿一次即可；用任意一条动作取原值。
+            CompensationStatus status = actionExecutor.compensate(
+                    fireKey, group.get(0).action(), preSnapshots);
+            for (ActionExecutionRecord rec : group) {
                 int idx = allRecords.indexOf(rec);
-                ActionExecutionRecord marked = actionExecutor.markCompensated(rec);
+                ActionExecutionRecord marked = actionExecutor.markCompensation(rec, status);
                 allRecords.set(idx, marked);
                 // 同步回填执行轨迹：设备状态、动作记录、最终结论三者必须一致。
                 executionLog.replaceAction(marked);
-                compensated.add(rec);
-            } else {
-                log.error("补偿动作失败，需人工介入 key={}", rec.idempotencyKey());
+            }
+            if (status == CompensationStatus.FAILED || status == CompensationStatus.ORIGINAL_UNAVAILABLE) {
+                log.error("补偿未成功（{}），需人工介入: {} 的动作记录 {}",
+                        status, group.get(0).action().targetDeviceId() + "."
+                                + group.get(0).action().property(),
+                        group.stream().map(r -> r.idempotencyKey()).toList());
             }
         }
-        return compensated;
     }
 
     private String buildPartialSummary(Rule rule, long fireNo,
                                        List<ActionExecutionRecord> records,
-                                       List<ActionExecutionRecord> compensated,
                                        ActionExecutionRecord failedAt) {
         List<String> parts = new ArrayList<>();
         parts.add("rule " + rule.id() + " fired (fireNo=" + fireNo + ") PARTIAL-FAILURE at action '"
@@ -210,12 +232,42 @@ public class RuleEngine {
             parts.add("  action '" + r.action().actionDefId() + "' -> " + r.status()
                     + " (attempts=" + r.attempts() + ")"
                     + (r.failureReason() != null ? " reason=" + r.failureReason() : "")
-                    + (r.compensated() ? " [compensated]" : "")
+                    + describeCompensation(r)
                     + (!r.errors().isEmpty() ? " errors=" + r.errors() : ""));
         }
-        parts.add("compensated " + compensated.size() + " previously succeeded action(s); "
-                + (compensated.size() < records.size() - 1 ? "SOME COMPENSATION FAILED, manual intervention needed"
-                : "system rolled back to pre-fire state"));
+
+        long restored = records.stream().filter(ActionExecutionRecord::compensated).count();
+        boolean anyFailedComp = records.stream().anyMatch(r ->
+                r.compensationStatus() == CompensationStatus.FAILED
+                        || r.compensationStatus() == CompensationStatus.ORIGINAL_UNAVAILABLE);
+        boolean anySuperseded = records.stream()
+                .anyMatch(r -> r.compensationStatus() == CompensationStatus.SUPERSEDED_BY_NEW_REPORT);
+
+        List<String> tail = new ArrayList<>();
+        tail.add("restored " + restored + " previously succeeded action record(s) to pre-fire original value");
+        if (anyFailedComp) {
+            tail.add("SOME COMPENSATION DID NOT RESTORE THE PRE-FIRE STATE (status=FAILED/ORIGINAL_UNAVAILABLE),"
+                    + " queried device state may still hold the changed value, manual intervention needed");
+        }
+        if (anySuperseded) {
+            tail.add("some rollback(s) skipped because a newer device report was confirmed after the fire;"
+                    + " queried state keeps that newer value and was never overwritten by the rollback");
+        }
+        if (!anyFailedComp && !anySuperseded && restored > 0) {
+            tail.add("system rolled back to pre-fire state");
+        }
+        parts.add(String.join("; ", tail));
         return String.join("\n", parts);
+    }
+
+    private static String describeCompensation(ActionExecutionRecord r) {
+        return switch (r.compensationStatus()) {
+            case NOT_NEEDED -> "";
+            case RESTORED -> " [compensated: restored to pre-fire original value]";
+            case SUPERSEDED_BY_NEW_REPORT -> " [compensation skipped: superseded by a newer confirmed report]";
+            case FAILED -> " [compensation FAILED: pre-fire state not restored, manual intervention needed]";
+            case ORIGINAL_UNAVAILABLE ->
+                    " [compensation impossible: pre-fire original value unavailable, manual intervention needed]";
+        };
     }
 }
