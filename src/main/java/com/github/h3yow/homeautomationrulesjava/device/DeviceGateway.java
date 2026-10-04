@@ -38,6 +38,8 @@ public class DeviceGateway {
     private final Map<String, Fault> faults = new ConcurrentHashMap<>();
     /** 幂等键 -> 是否已成功执行过物理副作用。 */
     private final Set<String> executedKeys = ConcurrentHashMap.newKeySet();
+    /** 物理副作用总次数（单调递增，含补偿）。 */
+    private int physicalWrites;
 
     private static String faultKey(String deviceId, String property) {
         return deviceId + "#" + property;
@@ -96,6 +98,7 @@ public class DeviceGateway {
         }
         // 唯一一次真实副作用。
         physicalState.put(physicalKey(deviceId, property), value);
+        physicalWrites++;
     }
 
     /** 测试辅助：统计设备物理侧被写入的属性数量。 */
@@ -103,10 +106,26 @@ public class DeviceGateway {
         return physicalState.size();
     }
 
+    /** 测试辅助：物理副作用总次数（含补偿回滚与清除），用于断言“动作实际下发的次数”。 */
+    public int totalPhysicalWrites() {
+        return physicalWrites;
+    }
+
+    /**
+     * 补偿专用：当触发前该属性本就没有值时，回滚语义是“清除这次动作留下的物理侧残留”，
+     * 使物理侧也回到触发前（无任何值）的状态。只能由补偿路径调用。
+     */
+    public void purgePhysical(String deviceId, String property) {
+        if (physicalState.remove(physicalKey(deviceId, property)) != null) {
+            physicalWrites++;
+        }
+    }
+
     /** 清空全部状态与故障（演示/测试重置）。 */
     public void reset() {
         physicalState.clear();
         faults.clear();
         executedKeys.clear();
+        physicalWrites = 0;
     }
 }

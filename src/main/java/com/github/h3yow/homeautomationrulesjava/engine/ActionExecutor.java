@@ -56,6 +56,9 @@ public class ActionExecutor {
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
     /** 已完成补偿的键，保证补偿幂等不重复。 */
     private final Set<String> compensatedKeys = ConcurrentHashMap.newKeySet();
+    /** 执行键 -> 动作回写进状态存储的那版已确认属性（补偿“比较并恢复”的基准）。 */
+    private final Map<String, com.github.h3yow.homeautomationrulesjava.model.DeviceState.ConfirmedProperty>
+            appliedProps = new ConcurrentHashMap<>();
 
     @Autowired
     public ActionExecutor(DeviceGateway gateway, DeviceRegistry deviceRegistry, StateStore stateStore,
@@ -135,8 +138,10 @@ public class ActionExecutor {
                 log.info("动作下发成功 key={} attempt={} -> {}={}",
                         key, i, action.targetDeviceId(), action.property(), action.value());
                 // 物理副作用成功，回写为已确认状态（用单调时间戳派生 seq 空间与上报独立）。
-                stateStore.applyCommand(action.targetDeviceId(), action.property(), action.value(),
-                        System.currentTimeMillis());
+                // 记录回写版本，供补偿时“比较并恢复”，避免回滚盖掉其后确认的新状态。
+                var after = stateStore.applyCommand(action.targetDeviceId(), action.property(),
+                        action.value(), System.currentTimeMillis());
+                appliedProps.put(key, after.get(action.property()));
                 return finish(key, action, ActionStatus.SUCCESS, attempts, null, false, List.of());
             } catch (DeviceCommandException ex) {
                 errors.add("attempt " + i + " -> " + ex.reason() + ": " + ex.getMessage());
@@ -153,28 +158,60 @@ public class ActionExecutor {
     /**
      * 补偿：把动作目标属性恢复为触发前快照中的原值。幂等。
      * 用于部分失败时回滚本触发实例内已成功的动作。
+     *
+     * 一致性语义（设备物理侧、已确认状态、动作记录、最终结论四者对齐）：
+     * - 物理侧：把触发前原值重新下发给设备；触发前该属性本就没有值时，清除物理侧残留；
+     * - 已确认状态：补偿成功后用“比较并恢复”把状态存储同步回原值
+     *   （触发前无值则移除该属性），使补偿完成后查询到的状态与触发前一致；
+     * - 若动作之后已有更新的状态被确认，恢复被放弃（绝不把已确认的新状态盖回旧值），
+     *   此时查询到的状态是那个更新的已确认值，属于合法终态；
+     * - 补偿失败（设备不可达等）返回 false，状态存储保持动作后的值，
+     *   动作记录不标记 compensated，最终结论必须提示人工介入，绝不假装已恢复。
      */
     public boolean compensate(String fireKey, Action action,
                               Map<String, com.github.h3yow.homeautomationrulesjava.model.DeviceState> preSnapshots) {
         String compKey = "comp:" + fireKey + ":" + action.actionDefId();
-        if (!compensatedKeys.add(compKey)) {
+        if (compensatedKeys.contains(compKey)) {
             log.info("补偿幂等命中，跳过 key={}", compKey);
             return true;
         }
         var pre = preSnapshots.get(action.targetDeviceId());
         Object original = pre == null ? null : pre.valueOf(action.property());
+        // 该动作当初回写进状态存储的版本，作为“比较并恢复”的基准。
+        var applied = appliedProps.get(fireKey + ":" + action.actionDefId());
+
         if (original == null) {
-            log.info("无触发前原值可回滚 key={} {}={}", compKey, action.targetDeviceId(), action.property());
+            // 触发前该属性没有已确认值：回滚 = 清除本次动作留下的残留（物理侧 + 状态存储）。
+            gateway.purgePhysical(action.targetDeviceId(), action.property());
+            boolean restored = applied == null || stateStore.restoreOriginal(
+                    action.targetDeviceId(), action.property(), applied.lastSeq(), null,
+                    System.currentTimeMillis());
+            compensatedKeys.add(compKey);
+            log.info("补偿成功 key={} 触发前无原值，已清除 {}.{} 的动作残留（状态存储恢复={}）",
+                    compKey, action.targetDeviceId(), action.property(), restored);
             return true;
         }
         try {
             gateway.sendCommand(compKey, action.targetDeviceId(), action.property(), original);
-            log.info("补偿成功 key={} 回滚 {}={}", compKey, action.targetDeviceId(), action.property(), original);
-            return true;
         } catch (DeviceCommandException ex) {
+            // 补偿失败：不占用幂等键（允许后续重试），状态存储保持动作后的值，
+            // 由上层在结论中明确“补偿失败，需人工介入”。
             log.error("补偿失败 key={} reason={}", compKey, ex.reason());
             return false;
         }
+        // 物理侧已回滚；同步状态存储。若期间已有更新的确认状态，则保留新值（合法终态）。
+        boolean restored = applied == null || stateStore.restoreOriginal(
+                action.targetDeviceId(), action.property(), applied.lastSeq(), original,
+                System.currentTimeMillis());
+        compensatedKeys.add(compKey);
+        if (restored) {
+            log.info("补偿成功 key={} 回滚 {}.{}={}（已确认状态同步恢复原值）",
+                    compKey, action.targetDeviceId(), action.property(), original);
+        } else {
+            log.info("补偿成功 key={} 物理侧已回滚 {}.{}={}；状态存储已有更新的确认值，保留新值不覆盖",
+                    compKey, action.targetDeviceId(), action.property(), original);
+        }
+        return true;
     }
 
     /** 供记录补偿结果：把某动作记录标记为已补偿。 */
@@ -227,5 +264,6 @@ public class ActionExecutor {
         finishedRecords.clear();
         locks.clear();
         compensatedKeys.clear();
+        appliedProps.clear();
     }
 }

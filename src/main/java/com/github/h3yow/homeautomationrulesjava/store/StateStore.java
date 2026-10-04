@@ -105,6 +105,39 @@ public class StateStore {
         }
     }
 
+    /**
+     * 补偿回滚专用的“比较并恢复”：仅当该属性当前仍停留在动作回写的那一版
+     * （lastSeq 与动作回写时一致，即此后没有任何更新的确认状态进来）时，
+     * 才把属性恢复为触发前原值；originalValue 为 null 表示触发前该属性不存在，
+     * 恢复语义为移除该属性。
+     *
+     * 若动作之后已有更新的状态被确认（例如回滚途中又进来一条被确认的新上报/新动作），
+     * 返回 false 且不做任何修改——回滚绝不能把已确认的新状态盖回旧值。
+     *
+     * @return true 表示已恢复为原值；false 表示已有更新确认状态，本次恢复被放弃
+     */
+    public boolean restoreOriginal(String deviceId, String property, long expectedSeq,
+                                   Object originalValue, long confirmedAt) {
+        Entry e = entry(deviceId);
+        e.lock.lock();
+        try {
+            DeviceState.ConfirmedProperty current = e.props.get(property);
+            if (current == null || current.lastSeq() != expectedSeq) {
+                return false;
+            }
+            if (originalValue == null) {
+                e.props.remove(property);
+            } else {
+                e.commandSeqWatermark++;
+                e.props.put(property, new DeviceState.ConfirmedProperty(
+                        originalValue, e.commandSeqWatermark, confirmedAt));
+            }
+            return true;
+        } finally {
+            e.lock.unlock();
+        }
+    }
+
     /** 测试/演示重置：清空全部已确认状态。 */
     public void reset() {
         entries.clear();

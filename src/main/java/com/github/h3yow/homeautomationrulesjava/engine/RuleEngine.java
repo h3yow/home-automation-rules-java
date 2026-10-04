@@ -159,7 +159,8 @@ public class RuleEngine {
                 // 补偿此前已成功动作，保证部分失败时系统收敛且无重复副作用。
                 List<ActionExecutionRecord> compensated = compensateSucceeded(
                         rule.id(), fireNo, succeeded, preSnapshots, records);
-                String summary = buildPartialSummary(rule, fireNo, records, compensated, rec);
+                String summary = buildPartialSummary(rule, fireNo, records, compensated,
+                        succeeded.size(), rec);
                 return RuleFireOutcome.fired(
                         rule.id(), rule.version(), fireNo, List.copyOf(records), summary);
             }
@@ -202,6 +203,7 @@ public class RuleEngine {
     private String buildPartialSummary(Rule rule, long fireNo,
                                        List<ActionExecutionRecord> records,
                                        List<ActionExecutionRecord> compensated,
+                                       int succeededCount,
                                        ActionExecutionRecord failedAt) {
         List<String> parts = new ArrayList<>();
         parts.add("rule " + rule.id() + " fired (fireNo=" + fireNo + ") PARTIAL-FAILURE at action '"
@@ -213,8 +215,12 @@ public class RuleEngine {
                     + (r.compensated() ? " [compensated]" : "")
                     + (!r.errors().isEmpty() ? " errors=" + r.errors() : ""));
         }
-        parts.add("compensated " + compensated.size() + " previously succeeded action(s); "
-                + (compensated.size() < records.size() - 1 ? "SOME COMPENSATION FAILED, manual intervention needed"
+        // 只有全部已成功动作都补偿完成，才允许下“已回滚到触发前状态”的结论；
+        // 任一补偿失败都必须明确提示人工介入，且此时设备状态保持动作后的值，两边一致。
+        parts.add("compensated " + compensated.size() + "/" + succeededCount
+                + " previously succeeded action(s); "
+                + (compensated.size() < succeededCount
+                ? "SOME COMPENSATION FAILED, device state NOT restored, manual intervention needed"
                 : "system rolled back to pre-fire state"));
         return String.join("\n", parts);
     }
